@@ -1,4 +1,4 @@
-module cassandra-caddy-storage
+module github.com/theemperor66/cassandra-caddy-storage
 
 go 1.24.0
 
