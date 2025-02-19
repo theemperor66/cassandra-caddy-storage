@@ -2,6 +2,7 @@ package cqlstorage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -15,7 +16,6 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/cespare/xxhash/v2"
 	"github.com/gocql/gocql"
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -23,11 +23,44 @@ func init() {
 	caddy.RegisterModule(&CQLStorage{})
 }
 
+// SecondsDuration is a custom duration type that supports configuration as a
+// plain number (interpreted as seconds) or as a duration string (e.g., "3s").
+type SecondsDuration time.Duration
+
+// UnmarshalJSON supports both number (in seconds) and string (e.g., "3s") formats.
+func (d *SecondsDuration) UnmarshalJSON(b []byte) error {
+	// Try unmarshaling as a number.
+	var num float64
+	if err := json.Unmarshal(b, &num); err == nil {
+		*d = SecondsDuration(time.Duration(num * float64(time.Second)))
+		return nil
+	}
+	// Otherwise, unmarshal as a string.
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	duration, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = SecondsDuration(duration)
+	return nil
+}
+
+// MarshalJSON marshals the duration as a string.
+func (d SecondsDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+// CQLStorage implements both JSON and Caddyfile configuration.
+// When configured via Caddyfile, UnmarshalCaddyfile is invoked; when configured via JSON,
+// the fields are filled by the JSON adapter, and Provision applies common defaults.
 type CQLStorage struct {
-	QueryTimeout  time.Duration `json:"query_timeout,omitempty"`
-	LockTimeout   time.Duration `json:"lock_timeout,omitempty"`
-	ContactPoints []string      `json:"contact_points,omitempty"`
-	Keyspace      string        `json:"keyspace,omitempty"`
+	QueryTimeout  SecondsDuration `json:"query_timeout,omitempty"`
+	LockTimeout   SecondsDuration `json:"lock_timeout,omitempty"`
+	ContactPoints []string        `json:"contact_points,omitempty"`
+	Keyspace      string          `json:"keyspace,omitempty"`
 
 	session *gocql.Session
 }
@@ -41,8 +74,9 @@ func (CQLStorage) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// UnmarshalCaddyfile is called only when using the Caddyfile adapter.
 func (cs *CQLStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	// Process each token in the block
+	// Process each token in the block.
 	for d.Next() {
 		key := d.Val()
 		switch key {
@@ -55,8 +89,8 @@ func (cs *CQLStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return d.Errf("invalid query_timeout: %v", err)
 			}
-			// Multiply by time.Second so that the duration is correct.
-			cs.QueryTimeout = time.Duration(qt) * time.Second
+			// Multiply by time.Second so that the value is in seconds.
+			cs.QueryTimeout = SecondsDuration(time.Duration(qt) * time.Second)
 
 		case "lock_timeout":
 			var val string
@@ -67,7 +101,7 @@ func (cs *CQLStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return d.Errf("invalid lock_timeout: %v", err)
 			}
-			cs.LockTimeout = time.Duration(lt) * time.Second
+			cs.LockTimeout = SecondsDuration(time.Duration(lt) * time.Second)
 
 		case "contact_points":
 			// Allow multiple contact points as separate arguments.
@@ -89,8 +123,10 @@ func (cs *CQLStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// Provision applies default values and falls back to environment variables when necessary.
+// This method is invoked regardless of the configuration source.
 func (cs *CQLStorage) Provision(ctx caddy.Context) error {
-	// If not set via Caddyfile, try the environment.
+	// If not set via the configuration file, try environment variables.
 	if len(cs.ContactPoints) == 0 {
 		if envCP := os.Getenv("CASSANDRA_CONTACT_POINTS"); envCP != "" {
 			cs.ContactPoints = splitHosts(envCP)
@@ -99,11 +135,11 @@ func (cs *CQLStorage) Provision(ctx caddy.Context) error {
 	if cs.Keyspace == "" {
 		cs.Keyspace = os.Getenv("CASSANDRA_KEYSPACE")
 	}
-	if cs.QueryTimeout == 0 {
-		cs.QueryTimeout = 3 * time.Second
+	if time.Duration(cs.QueryTimeout) == 0 {
+		cs.QueryTimeout = SecondsDuration(3 * time.Second)
 	}
-	if cs.LockTimeout == 0 {
-		cs.LockTimeout = 60 * time.Second
+	if time.Duration(cs.LockTimeout) == 0 {
+		cs.LockTimeout = SecondsDuration(60 * time.Second)
 	}
 
 	// Validate that we have contact points.
@@ -115,8 +151,8 @@ func (cs *CQLStorage) Provision(ctx caddy.Context) error {
 	cluster.ProtoVersion = 4
 	cluster.Hosts = cs.ContactPoints
 	cluster.Keyspace = cs.Keyspace
-	cluster.Timeout = cs.QueryTimeout
-	cluster.ConnectTimeout = cs.QueryTimeout
+	cluster.Timeout = time.Duration(cs.QueryTimeout)
+	cluster.ConnectTimeout = time.Duration(cs.QueryTimeout)
 
 	sess, err := cluster.CreateSession()
 	if err != nil {
@@ -152,7 +188,7 @@ func (cs *CQLStorage) ensureTables() error {
 	if cs.session == nil {
 		return errors.New("no Cassandra session available")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cs.QueryTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cs.QueryTimeout))
 	defer cancel()
 
 	if err := cs.session.Query(`
@@ -196,7 +232,7 @@ func (cs *CQLStorage) Lock(ctx context.Context, key string) error {
 
 	keyHash := computeKeyHash(key)
 	now := time.Now()
-	expires := now.Add(cs.LockTimeout)
+	expires := now.Add(time.Duration(cs.LockTimeout))
 
 	var existingExpires time.Time
 	err := cs.session.Query(`
@@ -265,7 +301,7 @@ func (cs *CQLStorage) Store(ctx context.Context, key string, value []byte) error
 	if cs.session == nil {
 		return errors.New("no Cassandra session available")
 	}
-	ctx, cancel := context.WithTimeout(ctx, cs.QueryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cs.QueryTimeout))
 	defer cancel()
 
 	keyHash := computeKeyHash(key)
@@ -283,7 +319,7 @@ func (cs *CQLStorage) Load(ctx context.Context, key string) ([]byte, error) {
 	if cs.session == nil {
 		return nil, errors.New("no Cassandra session available")
 	}
-	ctx, cancel := context.WithTimeout(ctx, cs.QueryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cs.QueryTimeout))
 	defer cancel()
 
 	keyHash := computeKeyHash(key)
@@ -304,7 +340,7 @@ func (cs *CQLStorage) Delete(ctx context.Context, key string) error {
 	if cs.session == nil {
 		return errors.New("no Cassandra session available")
 	}
-	ctx, cancel := context.WithTimeout(ctx, cs.QueryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cs.QueryTimeout))
 	defer cancel()
 
 	keyHash := computeKeyHash(key)
@@ -320,7 +356,7 @@ func (cs *CQLStorage) Exists(ctx context.Context, key string) bool {
 	if cs.session == nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(ctx, cs.QueryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cs.QueryTimeout))
 	defer cancel()
 
 	keyHash := computeKeyHash(key)
@@ -334,7 +370,7 @@ func (cs *CQLStorage) List(ctx context.Context, prefix string, recursive bool) (
 	if cs.session == nil {
 		return nil, errors.New("no Cassandra session available")
 	}
-	ctx, cancel := context.WithTimeout(ctx, cs.QueryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cs.QueryTimeout))
 	defer cancel()
 
 	if recursive {
@@ -361,7 +397,7 @@ func (cs *CQLStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo, 
 	if cs.session == nil {
 		return certmagic.KeyInfo{}, errors.New("no Cassandra session available")
 	}
-	ctx, cancel := context.WithTimeout(ctx, cs.QueryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cs.QueryTimeout))
 	defer cancel()
 
 	keyHash := computeKeyHash(key)
@@ -400,12 +436,6 @@ func splitHosts(raw string) []string {
 		}
 	}
 	return hosts
-}
-
-func generateOwnerID() string {
-	hostname, _ := os.Hostname()
-	return fmt.Sprintf("%s-%d-%s", hostname, os.Getpid(),
-		strings.ReplaceAll(uuid.New().String(), "-", "")[:8])
 }
 
 var (
