@@ -61,6 +61,8 @@ type CQLStorage struct {
 	LockTimeout   SecondsDuration `json:"lock_timeout,omitempty"`
 	ContactPoints []string        `json:"contact_points,omitempty"`
 	Keyspace      string          `json:"keyspace,omitempty"`
+	Username      string          `json:"username,omitempty"`
+	Password      string          `json:"password,omitempty"`
 
 	session *gocql.Session
 }
@@ -117,6 +119,20 @@ func (cs *CQLStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Err("keyspace requires a value")
 			}
 			cs.Keyspace = val
+
+		case "username":
+			var val string
+			if !d.Args(&val) {
+				return d.Err("username requires a value")
+			}
+			cs.Username = val
+
+		case "password":
+			var val string
+			if !d.Args(&val) {
+				return d.Err("password requires a value")
+			}
+			cs.Password = val
 		}
 	}
 	caddy.Log().Named("storage.cql").Debug("CQLStorage config", zap.Any("config", cs))
@@ -134,6 +150,12 @@ func (cs *CQLStorage) Provision(ctx caddy.Context) error {
 	}
 	if cs.Keyspace == "" {
 		cs.Keyspace = os.Getenv("CASSANDRA_KEYSPACE")
+	}
+	if cs.Username == "" {
+		cs.Username = os.Getenv("CASSANDRA_USER")
+	}
+	if cs.Password == "" {
+		cs.Password = os.Getenv("CASSANDRA_PASSWORD")
 	}
 	if time.Duration(cs.QueryTimeout) == 0 {
 		cs.QueryTimeout = SecondsDuration(3 * time.Second)
@@ -153,6 +175,14 @@ func (cs *CQLStorage) Provision(ctx caddy.Context) error {
 	cluster.Keyspace = cs.Keyspace
 	cluster.Timeout = time.Duration(cs.QueryTimeout)
 	cluster.ConnectTimeout = time.Duration(cs.QueryTimeout)
+
+	// Add authentication if credentials are provided
+	if cs.Username != "" && cs.Password != "" {
+		cluster.Authenticator = gocql.PasswordAuthenticator{
+			Username: cs.Username,
+			Password: cs.Password,
+		}
+	}
 
 	sess, err := cluster.CreateSession()
 	if err != nil {
